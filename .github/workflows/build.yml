@@ -1,0 +1,113 @@
+name: Netflix-Clone-Build and Deploy to EKS
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+jobs:
+  code_quality_analysis:
+    name: Code Quality Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  build_scan_docker_image:
+    name: Build Docker Image and scan with Trivy
+    runs-on: ubuntu-latest
+    needs: code_quality_analysis
+    steps:
+      - uses: actions/checkout@v4
+      - name: build docker image
+        run: |
+          docker build \
+            --build-arg TMDB_V3_API_KEY="${{ secrets.TMDB_V3_API_KEY }}" \
+            -t netflix:latest \
+            -f ./Netflix-Clone/Dockerfile ./Netflix-Clone
+
+      - name: Trivy Image Scan
+        uses: aquasecurity/trivy-action@master
+        continue-on-error: true
+        with:
+          image-ref: 'netflix:latest'
+          format: 'table'
+          output: 'trivy-image-results.txt'
+
+      - name: Upload Trivy scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-results
+          path: trivy-image-results.txt
+
+      - name: Save Docker image as tar
+        run: docker save -o netflix-latest.tar netflix:latest
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: netflix-latest
+          path: netflix-latest.tar
+
+  push_docker_image:
+    runs-on: ubuntu-latest
+    needs: build_scan_docker_image
+    steps:
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: netflix-latest
+
+      - name: Load Docker image
+        run: docker load -i netflix-latest.tar
+      - name: Push Docker Image to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Push Docker Image
+        run: |
+          docker tag netflix:latest ${{ secrets.DOCKER_USERNAME }}/netflix-clone:latest
+          docker push ${{ secrets.DOCKER_USERNAME }}/netflix-clone:latest
+
+
+  deploy_to_eks:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    needs: push_docker_image
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }} 
+
+      - name: Install kubectl
+        run: |
+          curl -O https://s3.us-west-2.amazonaws.com/amazon-eks/1.33.0/2025-05-01/bin/linux/amd64/kubectl
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Update kubeconfig for EKS
+        run: aws eks update-kubeconfig --region ${{ secrets.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+      - name: Deploy Kubernetes manifests
+        run: |
+          kubectl apply -f ./Netflix-Clone/k8-Manifest/deployment.yml
+          kubectl apply -f ./Netflix-Clone/k8-Manifest/service.yml
+      - name: Wait for deployment to be ready
+        run: |
+          kubectl rollout status deployment/netflix-app --timeout=300s || exit 1
+          kubectl get pods
+    
